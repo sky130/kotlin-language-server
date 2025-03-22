@@ -60,11 +60,11 @@ import org.javacs.kt.LOG
 import org.javacs.kt.CodegenConfiguration
 import org.javacs.kt.CompilerConfiguration
 import org.javacs.kt.ScriptsConfiguration
-import org.javacs.kt.util.KotlinLSException
 import org.javacs.kt.util.LoggingMessageCollector
+import org.jetbrains.kotlin.backend.jvm.JvmGeneratorExtensionsImpl
+import org.jetbrains.kotlin.backend.jvm.JvmIrCodegenFactory
 import org.jetbrains.kotlin.cli.common.output.writeAllTo
 import org.jetbrains.kotlin.codegen.ClassBuilderFactories
-import org.jetbrains.kotlin.codegen.KotlinCodegenFacade
 import org.jetbrains.kotlin.codegen.state.GenerationState
 import org.jetbrains.kotlin.container.getService
 import org.jetbrains.kotlin.descriptors.ModuleDescriptor
@@ -75,13 +75,20 @@ import org.jetbrains.kotlin.cli.jvm.compiler.TopDownAnalyzerFacadeForJVM
 import org.jetbrains.kotlin.cli.jvm.config.configureJdkClasspathRoots
 import org.jetbrains.kotlin.compiler.plugin.ExperimentalCompilerApi
 import org.jetbrains.kotlin.config.*
+import org.jetbrains.kotlin.descriptors.DeclarationDescriptor
 import org.jetbrains.kotlin.resolve.scopes.LexicalScope
 import org.jetbrains.kotlin.samWithReceiver.CliSamWithReceiverComponentContributor
 import org.jetbrains.kotlin.extensions.StorageComponentContainerContributor
+import org.jetbrains.kotlin.load.kotlin.toSourceElement
+import org.jetbrains.kotlin.resolve.source.PsiSourceFile
+import org.jetbrains.kotlin.serialization.deserialization.descriptors.DeserializedContainerSource
 import java.io.File
+import org.jetbrains.kotlin.config.CompilerConfiguration as ktCompilerConfigure
+import org.jetbrains.kotlin.backend.jvm.FacadeClassSourceShimForFragmentCompilation
 
 private val GRADLE_DSL_DEPENDENCY_PATTERN = Regex("^gradle-(?:kotlin-dsl|core).*\\.jar$")
 
+val STUB_UNBOUND_IR_SYMBOLS: CompilerConfigurationKey<Boolean> = CompilerConfigurationKey<Boolean>("stub unbound IR symbols")
 /**
  * Kotlin compiler APIs used to parse, analyze and compile
  * files and expressions.
@@ -594,18 +601,54 @@ class Compiler(
         outputDirectory.takeIf { codegenConfig.enabled }?.let {
             compileLock.withLock {
                 val compileEnv = compileEnvironmentFor(CompilationKind.DEFAULT)
-                val state = GenerationState.Builder(
+                val codegenFactory = createJvmIrCodegenFactory(compileEnv.environment.configuration)
+                val state = GenerationState(
                     project = compileEnv.environment.project,
                     builderFactory = ClassBuilderFactories.BINARIES,
                     module = module,
-                    bindingContext = bindingContext,
-                    files = files.toList(),
                     configuration = compileEnv.environment.configuration
-                ).build()
-                KotlinCodegenFacade.compileCorrectFiles(state)
+                )
+                codegenFactory.convertAndGenerate(files, state, bindingContext)
                 state.factory.writeAllTo(it)
             }
         }
+    }
+
+    private fun createJvmIrCodegenFactory(configuration: ktCompilerConfigure): JvmIrCodegenFactory {
+        val stubUnboundIrSymbols = configuration[STUB_UNBOUND_IR_SYMBOLS] == true
+        val jvmGeneratorExtensions = if (stubUnboundIrSymbols) {
+            object : JvmGeneratorExtensionsImpl(configuration) {
+                override fun getContainerSource(descriptor: DeclarationDescriptor): DeserializedContainerSource? {
+                    // Stubbed top-level function IR symbols (from other source files in the module) require a parent facade class to be
+                    // generated, which requires a container source to be provided. Without a facade class, function IR symbols will have
+                    // an `IrExternalPackageFragment` parent, which trips up code generation during IR lowering.
+                    //descriptor.toSourceElement.containingFile
+                    val psiSourceFile =
+                        descriptor.toSourceElement.containingFile as? PsiSourceFile ?: return super.getContainerSource(descriptor)
+                    return FacadeClassSourceShimForFragmentCompilation(psiSourceFile)
+                }
+            }
+        } else {
+            JvmGeneratorExtensionsImpl(configuration)
+        }
+        val ideCodegenSettings = JvmIrCodegenFactory.IdeCodegenSettings(
+            shouldStubAndNotLinkUnboundSymbols = stubUnboundIrSymbols,
+            shouldDeduplicateBuiltInSymbols = stubUnboundIrSymbols,
+            // Because the file to compile may be contained in a "common" multiplatform module, an `expect` declaration doesn't necessarily
+            // have an obvious associated `actual` symbol. `shouldStubOrphanedExpectSymbols` generates stubs for such `expect` declarations.
+            shouldStubOrphanedExpectSymbols = true,
+            // Likewise, the file to compile may be contained in a "platform" multiplatform module, where the `actual` declaration is
+            // referenced in the symbol table automatically, but not its `expect` counterpart, because it isn't contained in the files to
+            // compile. `shouldReferenceUndiscoveredExpectSymbols` references such `expect` symbols in the symbol table so that they can
+            // subsequently be stubbed.
+            shouldReferenceUndiscoveredExpectSymbols = true,
+        )
+
+        return JvmIrCodegenFactory(
+            configuration,
+            jvmGeneratorExtensions = jvmGeneratorExtensions,
+            ideCodegenSettings = ideCodegenSettings,
+        )
     }
 
     override fun close() {
